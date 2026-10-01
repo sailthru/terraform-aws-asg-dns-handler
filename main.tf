@@ -111,6 +111,7 @@ resource "aws_lambda_function" "autoscale_handling" {
   role             = aws_iam_role.autoscale_handling.arn
   handler          = "autoscale.lambda_handler"
   runtime          = "python3.14"
+  timeout          = 30
   source_code_hash = filebase64sha256(data.archive_file.autoscale.output_path)
   description      = "Handles DNS for autoscaling groups by receiving autoscaling notifications and setting/deleting records from route53"
   environment {
