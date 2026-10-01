@@ -16,6 +16,9 @@ HOSTNAME_TAG_NAME = "asg:hostname_pattern"
 LIFECYCLE_KEY = "LifecycleHookName"
 ASG_KEY = "AutoScalingGroupName"
 
+# Dedicated name for the ownership TXT so it never collides with a real TXT RRset at the hostname
+OWNER_RECORD_PREFIX = "_asg-owner."
+
 # Fetches IP of an instance via EC2 API
 def fetch_ip_from_ec2(instance_id):
     logger.info("Fetching IP for instance-id: %s", instance_id)
@@ -32,20 +35,20 @@ def fetch_ip_from_ec2(instance_id):
 # Private/public IPs of the ASG's live (pending/running) instances, excluding one id
 def fetch_live_ips(asg_name, exclude_instance_id):
     use_public = os.environ.get('USE_PUBLIC_IP') == "true"
-    response = ec2.describe_instances(
+    ips = set()
+    for page in ec2.get_paginator('describe_instances').paginate(
         Filters=[
             {'Name': 'tag:aws:autoscaling:groupName', 'Values': [asg_name]},
             {'Name': 'instance-state-name', 'Values': ['pending', 'running']}
         ]
-    )
-    ips = set()
-    for reservation in response['Reservations']:
-        for instance in reservation['Instances']:
-            if instance['InstanceId'] == exclude_instance_id:
-                continue
-            ip = instance.get('PublicIpAddress') if use_public else instance.get('PrivateIpAddress')
-            if ip:
-                ips.add(ip)
+    ):
+        for reservation in page['Reservations']:
+            for instance in reservation['Instances']:
+                if instance['InstanceId'] == exclude_instance_id:
+                    continue
+                ip = instance.get('PublicIpAddress') if use_public else instance.get('PrivateIpAddress')
+                if ip:
+                    ips.add(ip)
     return ips
 
 # Exact Name+Type lookup; returns the ResourceRecordSet or None if absent
@@ -66,7 +69,7 @@ def fetch_record(zone_id, hostname, record_type):
 
 # Reads the owner instance-id from the companion TXT record; returns (owner_id, record)
 def fetch_owner(zone_id, hostname):
-    record = fetch_record(zone_id, hostname, 'TXT')
+    record = fetch_record(zone_id, OWNER_RECORD_PREFIX + hostname, 'TXT')
     if record is None or not record.get('ResourceRecords'):
         return None, None
     return record['ResourceRecords'][0]['Value'].strip('"'), record
@@ -128,7 +131,7 @@ def upsert_record(zone_id, ip, hostname, instance_id, ttl):
     logger.info("Changing record with UPSERT for %s -> %s (owner %s) in %s", hostname, ip, instance_id, zone_id)
     change_records(zone_id, [
         {'Action': 'UPSERT', 'ResourceRecordSet': record_set(hostname, 'A', ttl, ip)},
-        {'Action': 'UPSERT', 'ResourceRecordSet': record_set(hostname, 'TXT', ttl, '"%s"' % instance_id)}
+        {'Action': 'UPSERT', 'ResourceRecordSet': record_set(OWNER_RECORD_PREFIX + hostname, 'TXT', ttl, '"%s"' % instance_id)}
     ])
 
 # Deletes the record only if it still belongs to the terminating instance
