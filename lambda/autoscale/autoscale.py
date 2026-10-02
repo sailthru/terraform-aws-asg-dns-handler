@@ -16,6 +16,9 @@ HOSTNAME_TAG_NAME = "asg:hostname_pattern"
 LIFECYCLE_KEY = "LifecycleHookName"
 ASG_KEY = "AutoScalingGroupName"
 
+# Dedicated name for the ownership TXT so it never collides with a real TXT RRset at the hostname
+OWNER_RECORD_PREFIX = "_asg-owner."
+
 # Fetches IP of an instance via EC2 API
 def fetch_ip_from_ec2(instance_id):
     logger.info("Fetching IP for instance-id: %s", instance_id)
@@ -29,20 +32,47 @@ def fetch_ip_from_ec2(instance_id):
 
     return ip_address
 
-# Fetches IP of an instance via route53 API
-def fetch_ip_from_route53(hostname, zone_id):
-    logger.info("Fetching IP for hostname: %s", hostname)
+# Private/public IPs of the ASG's live (pending/running) instances, excluding one id
+def fetch_live_ips(asg_name, exclude_instance_id):
+    use_public = os.environ.get('USE_PUBLIC_IP') == "true"
+    ips = set()
+    for page in ec2.get_paginator('describe_instances').paginate(
+        Filters=[
+            {'Name': 'tag:aws:autoscaling:groupName', 'Values': [asg_name]},
+            {'Name': 'instance-state-name', 'Values': ['pending', 'running']}
+        ]
+    ):
+        for reservation in page['Reservations']:
+            for instance in reservation['Instances']:
+                if instance['InstanceId'] == exclude_instance_id:
+                    continue
+                ip = instance.get('PublicIpAddress') if use_public else instance.get('PrivateIpAddress')
+                if ip:
+                    ips.add(ip)
+    return ips
 
-    ip_address = route53.list_resource_record_sets(
+# Exact Name+Type lookup; returns the ResourceRecordSet or None if absent
+def fetch_record(zone_id, hostname, record_type):
+    response = route53.list_resource_record_sets(
         HostedZoneId=zone_id,
         StartRecordName=hostname,
-        StartRecordType='A',
+        StartRecordType=record_type,
         MaxItems='1'
-    )['ResourceRecordSets'][0]['ResourceRecords'][0]['Value']
+    )
+    record_sets = response['ResourceRecordSets']
+    if not record_sets:
+        return None
+    record = record_sets[0]
+    if record['Name'].rstrip('.').lower() != hostname.rstrip('.').lower() or record['Type'] != record_type:
+        return None
+    return record
 
-    logger.info("Found IP for hostname %s: %s", hostname, ip_address)
-
-    return ip_address
+# Reads the owner instance-id from the companion TXT record; returns (owner_id, record)
+def fetch_owner(zone_id, hostname):
+    record = fetch_record(zone_id, OWNER_RECORD_PREFIX + hostname, 'TXT')
+    if record is None or not record.get('ResourceRecords'):
+        return None, None
+    return record['ResourceRecords'][0]['Value'].strip('"'), record
 
 # Fetches relevant tags from ASG
 # Returns tuple of hostname_pattern, zone_id
@@ -81,25 +111,55 @@ def update_name_tag(instance_id, hostname):
         ]
     )
 
-# Updates a Route53 record
-def update_record(zone_id, ip, hostname, operation):
-    logger.info("Changing record with %s for %s -> %s in %s", operation, hostname, ip, zone_id)
+# Submits a Route53 change batch (atomic across the given changes)
+def change_records(zone_id, changes):
     route53.change_resource_record_sets(
         HostedZoneId=zone_id,
-        ChangeBatch={
-            'Changes': [
-                {
-                    'Action': operation,
-                    'ResourceRecordSet': {
-                        'Name': hostname,
-                        'Type': 'A',
-                        'TTL': int(os.environ['ROUTE53_TTL']),
-                        'ResourceRecords': [{'Value': ip}]
-                    }
-                }
-            ]
-        }
+        ChangeBatch={'Changes': changes}
     )
+
+def record_set(hostname, record_type, ttl, value):
+    return {
+        'Name': hostname,
+        'Type': record_type,
+        'TTL': ttl,
+        'ResourceRecords': [{'Value': value}]
+    }
+
+# Upserts the A record and a companion TXT owner record (= instance_id) atomically
+def upsert_record(zone_id, ip, hostname, instance_id, ttl):
+    logger.info("Changing record with UPSERT for %s -> %s (owner %s) in %s", hostname, ip, instance_id, zone_id)
+    change_records(zone_id, [
+        {'Action': 'UPSERT', 'ResourceRecordSet': record_set(hostname, 'A', ttl, ip)},
+        {'Action': 'UPSERT', 'ResourceRecordSet': record_set(OWNER_RECORD_PREFIX + hostname, 'TXT', ttl, '"%s"' % instance_id)}
+    ])
+
+# Deletes the record only if it still belongs to the terminating instance
+def delete_record(zone_id, hostname, asg_name, instance_id):
+    a_record = fetch_record(zone_id, hostname, 'A')
+    if a_record is None:
+        logger.info("No A record for %s; nothing to delete", hostname)
+        return
+
+    owner, txt_record = fetch_owner(zone_id, hostname)
+    if owner is not None:
+        if owner != instance_id:
+            logger.info("Skipping delete for %s: slot owned by %s, not %s", hostname, owner, instance_id)
+            return
+        logger.info("Changing record with DELETE for %s (owner %s departing) in %s", hostname, instance_id, zone_id)
+        changes = [{'Action': 'DELETE', 'ResourceRecordSet': a_record}]
+        if txt_record is not None:
+            changes.append({'Action': 'DELETE', 'ResourceRecordSet': txt_record})
+        change_records(zone_id, changes)
+        return
+
+    # No owner tag yet (un-warmed slot): skip if a live instance holds this record
+    record_ip = a_record['ResourceRecords'][0]['Value']
+    if record_ip in fetch_live_ips(asg_name, instance_id):
+        logger.info("Skipping delete for %s: no owner tag but %s is held by a live instance", hostname, record_ip)
+        return
+    logger.info("Changing record with DELETE for %s -> %s (no owner tag, stale) in %s", hostname, record_ip, zone_id)
+    change_records(zone_id, [{'Action': 'DELETE', 'ResourceRecordSet': a_record}])
 
 # Processes a scaling event
 # Builds a hostname from tag metadata, fetches a IP, and updates records accordingly
@@ -109,27 +169,21 @@ def process_message(message):
         return
     logger.info("Processing %s event", message['LifecycleTransition'])
 
-    if message['LifecycleTransition'] == "autoscaling:EC2_INSTANCE_LAUNCHING":
-        operation = "UPSERT"
-    elif message['LifecycleTransition'] == "autoscaling:EC2_INSTANCE_TERMINATING" or message['LifecycleTransition'] == "autoscaling:EC2_INSTANCE_LAUNCH_ERROR":
-        operation = "DELETE"
-    else:
-        logger.error("Encountered unknown event type: %s", message['LifecycleTransition'])
-
+    transition = message['LifecycleTransition']
     asg_name = message['AutoScalingGroupName']
-    instance_id =  message['EC2InstanceId']
+    instance_id = message['EC2InstanceId']
 
     hostname_pattern, zone_id = fetch_tag_metadata(asg_name)
     hostname = build_hostname(hostname_pattern, instance_id)
 
-    if operation == "UPSERT":
+    if transition == "autoscaling:EC2_INSTANCE_LAUNCHING":
         ip = fetch_ip_from_ec2(instance_id)
-
         update_name_tag(instance_id, hostname)
+        upsert_record(zone_id, ip, hostname, instance_id, int(os.environ['ROUTE53_TTL']))
+    elif transition == "autoscaling:EC2_INSTANCE_TERMINATING" or transition == "autoscaling:EC2_INSTANCE_LAUNCH_ERROR":
+        delete_record(zone_id, hostname, asg_name, instance_id)
     else:
-        ip = fetch_ip_from_route53(hostname, zone_id)
-
-    update_record(zone_id, ip, hostname, operation)
+        logger.error("Encountered unknown event type: %s", transition)
 
 # Picks out the message from a SNS message and deserializes it
 def process_record(record):
